@@ -38,10 +38,12 @@ class Agent:
         self.v_mean = v
 
         # Flocking params
-        self.perception_radius = 5.0
-        self.max_turn = 5.0
-        self.max_speed = 4.9
-        self.min_speed = 0.1
+        self.perception_radius = 6.5  # larger neighborhood for better alignment
+        self.max_turn = 7.5  # more responsive steering
+        self.max_speed = 0.75  # slower top speed to keep formations coherent
+        self.min_speed = 0.2
+        self.separation_distance = radius * 2.8
+        self.separation_gain = 1.3
 
         # Collision avoidance
         self.collision_radius = radius * 3.0
@@ -114,6 +116,9 @@ class Agent:
 
     def flock(self, neighbors, avoidance_mode="NONE", time_horizon=1.5):
         """Classic Reynolds boids plus optional TTC/RVO avoidance."""
+         # If boundary steering is active, do not modify ω
+        if getattr(self, "boundary_override", False):
+            return
         if not neighbors:
             return
 
@@ -136,15 +141,15 @@ class Agent:
         for n in neighbors:
             dx, dy = self.x - n.x, self.y - n.y
             dist = np.hypot(dx, dy)
-            if dist < 0.4 and dist > 1e-6:
-                separation_vec += np.array([dx, dy]) / dist**2
+            if dist < self.separation_distance and dist > 1e-6:
+                separation_vec += (np.array([dx, dy]) / dist**2) * self.separation_gain
 
         # Alignment
         avg_vel = velocities.mean(axis=0)
         alignment_vec = (
             avg_vel
             - np.array([np.cos(np.deg2rad(self.angle)) * self.v, np.sin(np.deg2rad(self.angle)) * self.v])
-        ) * 0.125
+        ) * 0.18
 
         # Optional collision avoidance
         avoidance_vec = np.zeros(2)
@@ -164,15 +169,17 @@ class Agent:
 
         self.v = np.clip(self.v, self.min_speed, self.max_speed)
 
-    def bound_steer(self, xmin, xmax, ymin, ymax, buffer=2.0, strength=0.05):
-        """Reynolds-style boundary steering (no bouncing)."""
+    def bound_steer(self, xmin, xmax, ymin, ymax,
+                buffer=2.0, strength=0.05):
         steer = np.zeros(2)
 
+        # Check distances
         dx_min = self.x - xmin
         dx_max = xmax - self.x
         dy_min = self.y - ymin
         dy_max = ymax - self.y
 
+        # Build steering vector
         if dx_min < buffer:
             steer[0] += strength * (buffer - dx_min)
         if dx_max < buffer:
@@ -182,33 +189,46 @@ class Agent:
         if dy_max < buffer:
             steer[1] -= strength * (buffer - dy_max)
 
+        # If no boundary influence → normal flocking allowed
         if np.linalg.norm(steer) < 1e-6:
-            return None
+            self.boundary_override = False
+            return False
 
+        # Otherwise we ARE in boundary steering mode
+        self.boundary_override = True
+
+        # Convert vector to desired heading
         desired_angle = np.rad2deg(np.arctan2(steer[1], steer[0])) % 360
         diff = (desired_angle - self.angle + 540) % 360 - 180
+
+        # Strong clamp so boundary always wins
         self.omega = np.clip(diff, -self.max_turn, self.max_turn)
 
         return True
+
 
     def update(self, xmin, xmax, ymin, ymax):
         self.angle = (self.angle + self.omega) % 360
         theta = np.deg2rad(self.angle)
 
+        # Reynolds-style soft boundaries
+        self.bound_steer(xmin, xmax, ymin, ymax)
+        
+        # # Bounce from walls
+        # if self.x - self.radius < xmin or self.x + self.radius > xmax:
+        #     self.x = np.clip(self.x, xmin + self.radius, xmax - self.radius)
+        #     self.angle = (180 - self.angle) % 360
+        #     self.target_angle = self.angle
+        #     theta = np.deg2rad(self.angle)
+        # if self.y - self.radius < ymin or self.y + self.radius > ymax:
+        #     self.y = np.clip(self.y, ymin + self.radius, ymax - self.radius)
+        #     self.angle = (-self.angle) % 360
+        #     self.target_angle = self.angle
+        #     theta = np.deg2rad(self.angle)
+
+
         self.x += self.v * np.cos(theta)
         self.y += self.v * np.sin(theta)
-
-        # Bounce from walls
-        if self.x - self.radius < xmin or self.x + self.radius > xmax:
-            self.x = np.clip(self.x, xmin + self.radius, xmax - self.radius)
-            self.angle = (180 - self.angle) % 360
-            self.target_angle = self.angle
-            theta = np.deg2rad(self.angle)
-        if self.y - self.radius < ymin or self.y + self.radius > ymax:
-            self.y = np.clip(self.y, ymin + self.radius, ymax - self.radius)
-            self.angle = (-self.angle) % 360
-            self.target_angle = self.angle
-            theta = np.deg2rad(self.angle)
 
         cx, cy = self.x, self.y
         x_end = cx + self.radius * np.cos(theta)
@@ -235,9 +255,9 @@ ax.set_title(f"Reynolds Agents ({AVOIDANCE_MODE} avoidance)")
 ax.grid(True)
 
 agents = []
-n_agents = 12
-n_cols = 4
-spacing = 1.0
+n_agents = 6
+n_cols = 2
+spacing = 0.5
 initial_angle = 90.0
 
 x_positions = np.linspace(-spacing, spacing, n_cols)
