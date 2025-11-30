@@ -1,13 +1,30 @@
+"""Reynolds-style agents with optional TTC or RVO avoidance on top of the
+Agent implementation from agents.py."""
+
 import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.patches import Circle
 from matplotlib.animation import FuncAnimation
+from matplotlib.patches import Circle
 import random
 
+# --- Simulation configuration ---
+AVOIDANCE_MODE = "RVO"  # options: "TTC", "RVO", "NONE"
+TIME_HORIZON = 5.0
+
+
 class Agent:
-    def __init__(self, ax, x=0.0, y=0.0, angle=0.0,
-                 v=0.02, omega=0.0, radius=0.25,
-                 facecolor='C1', edgecolor='k'):
+    def __init__(
+        self,
+        ax,
+        x=0.0,
+        y=0.0,
+        angle=0.0,
+        v=0.02,
+        omega=0.0,
+        radius=0.25,
+        facecolor="C1",
+        edgecolor="k",
+    ):
         self.x = x
         self.y = y
         self.angle = angle  # degrees
@@ -26,12 +43,25 @@ class Agent:
         self.max_speed = 4.9
         self.min_speed = 0.1
 
-        self.circle = Circle((x, y), radius,
-                             facecolor=facecolor, edgecolor=edgecolor,
-                             alpha=0.6, lw=1.5, zorder=2)
+        # Collision avoidance
+        self.collision_radius = radius * 3.0
+
+        self.circle = Circle(
+            (x, y),
+            radius,
+            facecolor=facecolor,
+            edgecolor=edgecolor,
+            alpha=0.6,
+            lw=1.5,
+            zorder=2,
+        )
         ax.add_patch(self.circle)
         (self.orientation_line,) = ax.plot([], [], color=edgecolor, lw=2, zorder=3)
         (self.head_marker,) = ax.plot([], [], "o", color=edgecolor, markersize=5, zorder=4)
+
+    def velocity_vec(self):
+        theta = np.deg2rad(self.angle)
+        return np.array([np.cos(theta) * self.v, np.sin(theta) * self.v])
 
     def set_command(self, v, omega):
         self.v = v
@@ -45,35 +75,63 @@ class Agent:
         self.omega = np.clip(diff, -self.turn_rate, self.turn_rate)
         self.v = max(0.0, self.v_mean + random.uniform(-0.005, 0.005))
 
-    def flock(self, neighbors):
-        """Classic Reynolds boids: cohesion, separation, alignment."""
+    def _ttc_avoidance(self, neighbors, time_horizon):
+        """Time-to-collision avoidance vector."""
+        avoidance = np.zeros(2)
+        v_i = self.velocity_vec()
+        for n in neighbors:
+            r = np.array([n.x - self.x, n.y - self.y])
+            v_rel = v_i - n.velocity_vec()
+            vrel2 = np.dot(v_rel, v_rel)
+            if vrel2 < 1e-9:
+                continue
+            t_star = -np.dot(r, v_rel) / vrel2
+            if 0 < t_star < time_horizon:
+                closest = r + v_rel * t_star
+                d2 = np.dot(closest, closest)
+                if d2 < self.collision_radius**2:
+                    dir_away = -closest / (np.linalg.norm(closest) + 1e-9)
+                    weight = (self.collision_radius - np.sqrt(d2)) / self.collision_radius
+                    weight *= 1.0 / (t_star + 1e-3)
+                    avoidance += dir_away * weight
+        return avoidance
+
+    def _rvo_avoidance(self, neighbors):
+        """Reciprocal velocity obstacle style steering."""
+        avoidance = np.zeros(2)
+        v_i = self.velocity_vec()
+        for n in neighbors:
+            r = np.array([n.x - self.x, n.y - self.y])
+            dist = np.linalg.norm(r)
+            if dist < 1e-9:
+                continue
+            v_rel = v_i - n.velocity_vec()
+            if dist < self.collision_radius:
+                avoidance += (r / dist) * 0.5
+            elif np.dot(v_rel, r) < 0:  # closing in
+                avoidance += (r / dist) * 0.25
+        return avoidance
+
+    def flock(self, neighbors, avoidance_mode="NONE", time_horizon=1.5):
+        """Classic Reynolds boids plus optional TTC/RVO avoidance."""
         if not neighbors:
-            # If no neighbors, keep previous heading (or wander if you prefer)
             return
 
-        # -------------------------
-        # Prepare arrays
-        # -------------------------
         positions = np.array([[n.x, n.y] for n in neighbors])
-        velocities = np.array([
-            [np.cos(np.deg2rad(n.angle)) * n.v,
-            np.sin(np.deg2rad(n.angle)) * n.v]
-            for n in neighbors
-        ])
+        velocities = np.array(
+            [
+                [np.cos(np.deg2rad(n.angle)) * n.v, np.sin(np.deg2rad(n.angle)) * n.v]
+                for n in neighbors
+            ]
+        )
 
         self_pos = np.array([self.x, self.y])
 
-        # -------------------------
-        # RULE 1: COHESION
-        # Move 1% toward center of mass
-        # -------------------------
+        # Cohesion
         center_of_mass = positions.mean(axis=0)
         cohesion_vec = (center_of_mass - self_pos) * 0.05
 
-        # -------------------------
-        # RULE 2: SEPARATION
-        # Strong repulsion within small radius
-        # -------------------------
+        # Separation
         separation_vec = np.zeros(2)
         for n in neighbors:
             dx, dy = self.x - n.x, self.y - n.y
@@ -81,43 +139,40 @@ class Agent:
             if dist < 0.4 and dist > 1e-6:
                 separation_vec += np.array([dx, dy]) / dist**2
 
-        # -------------------------
-        # RULE 3: ALIGNMENT
-        # Match average velocity of neighbors
-        # -------------------------
+        # Alignment
         avg_vel = velocities.mean(axis=0)
-        # steer 12.5% toward matched velocity
-        alignment_vec = (avg_vel - np.array([
-            np.cos(np.deg2rad(self.angle)) * self.v,
-            np.sin(np.deg2rad(self.angle)) * self.v
-        ])) * 0.125
+        alignment_vec = (
+            avg_vel
+            - np.array([np.cos(np.deg2rad(self.angle)) * self.v, np.sin(np.deg2rad(self.angle)) * self.v])
+        ) * 0.125
 
-        # -------------------------
-        # Combine rule influence
-        # -------------------------
-        steering = cohesion_vec + separation_vec + alignment_vec
+        # Optional collision avoidance
+        avoidance_vec = np.zeros(2)
+        if avoidance_mode.upper() == "TTC":
+            avoidance_vec = self._ttc_avoidance(neighbors, time_horizon)
+        elif avoidance_mode.upper() == "RVO":
+            avoidance_vec = self._rvo_avoidance(neighbors)
 
-        # Convert steering vector → desired angle
+        steering = cohesion_vec + separation_vec + alignment_vec + avoidance_vec
+        norm = np.linalg.norm(steering)
+        if norm < 1e-9:
+            return
+
         desired_angle = np.rad2deg(np.arctan2(steering[1], steering[0])) % 360
-
-        # Heading change (clamped)
         diff = (desired_angle - self.angle + 540) % 360 - 180
         self.omega = np.clip(diff, -self.max_turn, self.max_turn)
 
-        # Speed nudging (optional)
         self.v = np.clip(self.v, self.min_speed, self.max_speed)
 
     def bound_steer(self, xmin, xmax, ymin, ymax, buffer=2.0, strength=0.05):
         """Reynolds-style boundary steering (no bouncing)."""
         steer = np.zeros(2)
 
-        # Distance from each boundary
         dx_min = self.x - xmin
         dx_max = xmax - self.x
         dy_min = self.y - ymin
         dy_max = ymax - self.y
 
-        # If inside buffer zone → add inward steering
         if dx_min < buffer:
             steer[0] += strength * (buffer - dx_min)
         if dx_max < buffer:
@@ -128,17 +183,13 @@ class Agent:
             steer[1] -= strength * (buffer - dy_max)
 
         if np.linalg.norm(steer) < 1e-6:
-            return None  # no steering needed
+            return None
 
-        # Convert vector to heading
         desired_angle = np.rad2deg(np.arctan2(steer[1], steer[0])) % 360
         diff = (desired_angle - self.angle + 540) % 360 - 180
-
-        # Apply a gentle turn
         self.omega = np.clip(diff, -self.max_turn, self.max_turn)
 
         return True
-
 
     def update(self, xmin, xmax, ymin, ymax):
         self.angle = (self.angle + self.omega) % 360
@@ -169,27 +220,26 @@ class Agent:
 
         return self.circle, self.orientation_line, self.head_marker
 
+
 # --- Simulation setup ---
 xmin, xmax = -10.5, 10.5
 ymin, ymax = -5, 5
 
-fig, ax = plt.subplots(figsize=(6, 6))
+fig, ax = plt.subplots(figsize=(10, 6))
 ax.set_aspect("equal")
 ax.set_xlim(xmin, xmax)
 ax.set_ylim(ymin, ymax)
 ax.set_xlabel("X")
 ax.set_ylabel("Y")
-ax.set_title("Reynolds Flocking Agents")
+ax.set_title(f"Reynolds Agents ({AVOIDANCE_MODE} avoidance)")
 ax.grid(True)
 
-# --- Agent generation: 10 agents in a grid, aligned headings ---
 agents = []
-n_agents = 5
-n_cols = 1  # number of columns in the grid
-spacing = 0.6  # spacing between agents
-initial_angle = 90.0  # all agents face +x
+n_agents = 12
+n_cols = 4
+spacing = 1.0
+initial_angle = 90.0
 
-# Compute rows/cols positions so they are centered in the arena
 x_positions = np.linspace(-spacing, spacing, n_cols)
 n_rows = (n_agents + n_cols - 1) // n_cols
 y_positions = np.linspace(-spacing, spacing, n_rows)
@@ -209,20 +259,19 @@ def init():
         artists.extend(a.update(xmin, xmax, ymin, ymax))
     return artists
 
+
 def update(frame):
     artists = []
-    flocking_mode = True
-
     for a in agents:
-        if flocking_mode:
-            neighbors = [n for n in agents
-                         if n is not a and np.hypot(n.x - a.x, n.y - a.y) < a.perception_radius]
-            a.flock(neighbors)
-        else:
-            a.wander()
+        neighbors = [
+            n
+            for n in agents
+            if n is not a and np.hypot(n.x - a.x, n.y - a.y) < a.perception_radius
+        ]
+        a.flock(neighbors, avoidance_mode=AVOIDANCE_MODE, time_horizon=TIME_HORIZON)
         artists.extend(a.update(xmin, xmax, ymin, ymax))
     return artists
 
-anim = FuncAnimation(fig, update, init_func=init,
-                     frames=400, interval=30, blit=True)
+
+anim = FuncAnimation(fig, update, init_func=init, frames=400, interval=30, blit=True)
 plt.show()
